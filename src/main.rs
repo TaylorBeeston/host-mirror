@@ -53,6 +53,10 @@ impl Drop for HostInput {
 struct HostInput {
     keyboard: UInputHandle<File>,
     held_keys: std::cell::RefCell<std::collections::BTreeSet<u16>>,
+    /// Last key event time; a held key with no key traffic past `key_hold_max`
+    /// is force-released (Stardust can drop key-ups, e.g. Super).
+    last_key: std::cell::Cell<std::time::Instant>,
+    key_hold_max: std::time::Duration,
     mouse: UInputHandle<File>,
     origin: (f32, f32),
     extent: (f32, f32),
@@ -150,6 +154,10 @@ impl HostInput {
         Ok(Self {
             keyboard,
             held_keys: Default::default(),
+            last_key: std::cell::Cell::new(std::time::Instant::now()),
+            key_hold_max: std::time::Duration::from_millis(
+                std::env::var("HOST_MIRROR_KEY_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),
+            ),
             mouse,
             origin: (origin.0 as f32, origin.1 as f32),
             extent: (extent.0.max(1) as f32, extent.1.max(1) as f32),
@@ -214,6 +222,10 @@ impl HostInput {
             let mut held = self.held_keys.borrow_mut();
             if pressed { held.insert(keycode); } else { held.remove(&keycode); }
         }
+        self.last_key.set(std::time::Instant::now());
+        if matches!(keycode, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126) {
+            log::info!("modifier {keycode} {}", if pressed { "down" } else { "up" });
+        }
         let time = get_time();
         let events = [
             new_event(time, EV_KEY, keycode, i32::from(pressed)),
@@ -235,6 +247,15 @@ impl HostInput {
         events.push(new_event(time, EV_SYN, 0, 0));
         if let Err(err) = self.keyboard.write(&events) {
             log::warn!("keyboard release_all failed: {err}");
+        }
+    }
+
+    /// Watchdog: release held keys when no key event arrived for `key_hold_max`.
+    fn release_stale(&self) {
+        if self.held_keys.borrow().is_empty() { return; }
+        if self.last_key.get().elapsed() >= self.key_hold_max {
+            log::warn!("no key-up within {:?}; watchdog releasing", self.key_hold_max);
+            self.release_all();
         }
     }
 
@@ -486,6 +507,9 @@ fn main() -> Result<()> {
         ));
         match event {
             Event::AboutToWait => {
+                if let Some(host_input) = &host_input {
+                    host_input.release_stale();
+                }
                 let received =
                     <PipewireCapture<Captured> as WlxCapture<(), Captured>>::receive(&mut capture);
                 let frame_size = match &received {
@@ -650,8 +674,9 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                WindowEvent::Focused(false) => {
+                WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. } => {
                     if let Some(host_input) = &host_input {
+                        log::info!("focus/pointer left; releasing keys");
                         host_input.release_all();
                     }
                 }
