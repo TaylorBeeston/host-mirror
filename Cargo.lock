@@ -1084,6 +1084,9 @@ dependencies = [
  "libc",
  "log",
  "softbuffer",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
  "wlx-capture",
 ]
@@ -3591,27 +3594,3 @@ dependencies = [
  "syn",
  "winnow 0.7.15",
 ]
-
-[[patch.unused]]
-name = "stardust-xr-fusion"
-version = "0.51.1"
-
-[[patch.unused]]
-name = "stardust-xr-gluon"
-version = "0.51.1"
-
-[[patch.unused]]
-name = "stardust-xr-protocol"
-version = "0.51.1"
-
-[[patch.unused]]
-name = "stardust-xr-wire"
-version = "0.51.1"
-
-[[patch.unused]]
-name = "stardust-xr-asteroids"
-version = "0.51.0"
-
-[[patch.unused]]
-name = "stardust-xr-molecules"
-version = "0.51.0"

@@ -1,4 +1,7 @@
+mod dmabuf;
+
 use anyhow::{anyhow, Context, Result};
+use dmabuf::{DmabufPresenter, OwnedDmabuf};
 use input_linux::{
     AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, InputId, Key, RelativeAxis,
     UInputHandle,
@@ -27,6 +30,12 @@ const EV_SYN: u16 = 0x0;
 const EV_KEY: u16 = 0x1;
 const EV_REL: u16 = 0x2;
 const EV_ABS: u16 = 0x3;
+
+/// What the PipeWire thread hands the main thread.
+enum Captured {
+    Cpu(OwnedFrame),
+    Dmabuf(OwnedDmabuf),
+}
 
 #[derive(Clone)]
 struct OwnedFrame {
@@ -274,6 +283,12 @@ fn parse_opts() -> Result<Opts> {
 
 fn main() -> Result<()> {
     env_logger::init();
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).map(String::as_str) == Some("--probe-dmabuf") {
+            return dmabuf::probe(args.get(2).map(String::as_str));
+        }
+    }
     let opts = parse_opts()?;
     let saved_token = opts
         .token_file
@@ -315,9 +330,7 @@ fn main() -> Result<()> {
         desktop_size
     );
 
-    let mut capture =
-        PipewireCapture::<OwnedFrame>::new("stardust-host-mirror".into(), stream.node_id);
-    capture.init(&[], (), receive_frame);
+    let node_id = stream.node_id;
 
     let host_input = match (!opts.no_input)
         .then(|| HostInput::new(desktop_origin, desktop_size))
@@ -358,7 +371,54 @@ fn main() -> Result<()> {
         .map_err(|err| anyhow!("create softbuffer context: {err:?}"))?;
     let mut surface = SoftbufferSurface::new(&context, window.clone())
         .map_err(|err| anyhow!("create softbuffer surface: {err:?}"))?;
+    // DMA-BUF present path (default on; HOST_MIRROR_DMABUF=0 forces the shm/softbuffer path).
+    let want_dmabuf = std::env::var("HOST_MIRROR_DMABUF").map_or(true, |v| v != "0");
+    let mut presenter = if want_dmabuf {
+        match DmabufPresenter::new(&window) {
+            Ok(p) => Some(p),
+            Err(err) => {
+                log::warn!("dmabuf present path unavailable, using shm: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dmabuf_formats = presenter
+        .as_ref()
+        .map(|p| {
+            let formats = p.capture_formats(&dmabuf::default_order());
+            log::info!(
+                "compositor advertises {} dmabuf (format, modifier) pairs; offering PipeWire: {}",
+                p.advertised().len(),
+                formats
+                    .iter()
+                    .map(|f| format!("{}{:x?}", f.fourcc, f.modifiers))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            formats
+        })
+        .unwrap_or_default();
+    if presenter.is_some() && dmabuf_formats.is_empty() {
+        log::warn!("no importable 8-bit RGB dmabuf formats advertised; using shm");
+        presenter = None;
+    }
+    let start_capture = move |formats: &[wlx_capture::frame::DrmFormat]| {
+        let mut capture = PipewireCapture::<Captured>::new("stardust-host-mirror".into(), node_id);
+        capture.init(formats, (), receive_frame);
+        capture
+    };
+    let mut capture = start_capture(&dmabuf_formats);
     let mut current_frame: Option<OwnedFrame> = None;
+    // Size of the last frame of either kind (input mapping + buffer size).
+    let mut current_size: Option<(u32, u32)> = None;
+    // True once a dmabuf frame was attached: softbuffer must not present over it.
+    let mut dmabuf_active = false;
+    // winit has acked the first xdg configure once it emits Resized/RedrawRequested;
+    // attaching a buffer before that is a protocol error.
+    let mut configured = false;
+    let mut pending_dmabuf: Option<OwnedDmabuf> = None;
     let fixed_size = opts.size.is_some();
     // Buffer size stays at the capture (or --size) size even when the compositor configures
     // the toplevel smaller: Stardust panels then keep their px/density size, and resizes
@@ -385,21 +445,71 @@ fn main() -> Result<()> {
         ));
         match event {
             Event::AboutToWait => {
-                if let Some(frame) =
-                    <PipewireCapture<OwnedFrame> as WlxCapture<(), OwnedFrame>>::receive(
-                        &mut capture,
-                    )
-                {
+                let received =
+                    <PipewireCapture<Captured> as WlxCapture<(), Captured>>::receive(&mut capture);
+                let frame_size = match &received {
+                    Some(Captured::Cpu(f)) => Some((f.width, f.height)),
+                    Some(Captured::Dmabuf(f)) => Some((f.width, f.height)),
+                    None => None,
+                };
+                if let Some((fw, fh)) = frame_size {
                     // Match the window to the real capture size (portal `size` can be
                     // logical px on a scaled monitor) unless --size was given.
-                    if !fixed_size
-                        && current_frame
-                            .as_ref()
-                            .is_none_or(|f| (f.width, f.height) != (frame.width, frame.height))
-                    {
-                        log::info!("capture frame {}x{}; resizing window", frame.width, frame.height);
-                        pin_size(frame.width, frame.height);
-                        let _ = window.request_inner_size(PhysicalSize::new(frame.width, frame.height));
+                    if !fixed_size && current_size != Some((fw, fh)) {
+                        log::info!("capture frame {fw}x{fh}; resizing window");
+                        pin_size(fw, fh);
+                        let _ = window.request_inner_size(PhysicalSize::new(fw, fh));
+                    }
+                    current_size = Some((fw, fh));
+                }
+                let (received_cpu, received_dmabuf) = match received {
+                    Some(Captured::Cpu(f)) => (Some(f), None),
+                    Some(Captured::Dmabuf(f)) => (None, Some(f)),
+                    None => (None, None),
+                };
+                if let Some(f) = received_dmabuf {
+                    stats.0 += 1;
+                    pending_dmabuf = Some(f);
+                }
+                if configured {
+                    if let Some(f) = pending_dmabuf.take() {
+                        let result = match presenter.as_mut() {
+                            Some(p) => p.present(&f),
+                            None => Err(anyhow!("dmabuf frame but no presenter")),
+                        };
+                        match result {
+                            Ok(()) => {
+                                if !dmabuf_active {
+                                    log::info!("presenting via dmabuf (zero CPU copy) {}x{} fourcc={:#x} modifier={:#x}", f.width, f.height, f.fourcc, f.modifier);
+                                }
+                                dmabuf_active = true;
+                                stats.1 += 1;
+                            }
+                            Err(err) => {
+                                log::warn!("dmabuf present failed, restarting capture on shm: {err:#}");
+                                presenter = None;
+                                dmabuf_active = false;
+                                drop(f);
+                                capture = start_capture(&[]);
+                            }
+                        }
+                    }
+                }
+                if stats.2.elapsed().as_secs() >= 5 && dmabuf_active {
+                    let win = window.inner_size();
+                    log::info!(
+                        "stats: frames={} presents={} {} window={}x{}",
+                        stats.0, stats.1,
+                        presenter.as_ref().map(|p| p.stats()).unwrap_or_default(),
+                        win.width, win.height
+                    );
+                    stats.2 = std::time::Instant::now();
+                }
+                if let Some(frame) = received_cpu {
+                    if dmabuf_active {
+                        // Renegotiated to shm mid-stream: hand the surface back to softbuffer.
+                        log::info!("capture switched to shm frames");
+                        dmabuf_active = false;
                     }
                     stats.0 += 1;
                     if !dumped {
@@ -447,11 +557,12 @@ fn main() -> Result<()> {
                     }
                 }
                 WindowEvent::Resized(size) => {
+                    configured = true;
                     if lock_size {
                         // Keep the window geometry equal to the buffer: the panel shell reads
                         // geometry as the toplevel size, so a configure from it (e.g. Flatland's
                         // initial resize) would otherwise squash the panel's aspect.
-                        let want = buffer_size(&window, current_frame.as_ref(), lock_size, fixed_size, (win_w, win_h));
+                        let want = buffer_size(&window, current_size, lock_size, fixed_size, (win_w, win_h));
                         if want != size && want.width > 0 && want.height > 0 {
                             log::info!("configured {}x{}; re-requesting {}x{}", size.width, size.height, want.width, want.height);
                             let _ = window.request_inner_size(want);
@@ -468,7 +579,7 @@ fn main() -> Result<()> {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if let Some(host_input) = &host_input {
-                        let size = buffer_size(&window, current_frame.as_ref(), lock_size, fixed_size, (win_w, win_h));
+                        let size = buffer_size(&window, current_size, lock_size, fixed_size, (win_w, win_h));
                         if size.width > 0 && size.height > 0 {
                             let x = desktop_origin.0 as f32
                                 + (position.x as f32 / size.width as f32) * desktop_size.0 as f32;
@@ -504,7 +615,11 @@ fn main() -> Result<()> {
                     }
                 }
                 WindowEvent::RedrawRequested => {
-                    let size = buffer_size(&window, current_frame.as_ref(), lock_size, fixed_size, (win_w, win_h));
+                    configured = true;
+                    if dmabuf_active {
+                        return;
+                    }
+                    let size = buffer_size(&window, current_size, lock_size, fixed_size, (win_w, win_h));
                     let (Some(width), Some(height)) =
                         (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                     else {
@@ -539,7 +654,7 @@ fn main() -> Result<()> {
 
 fn buffer_size(
     window: &winit::window::Window,
-    frame: Option<&OwnedFrame>,
+    frame: Option<(u32, u32)>,
     lock_size: bool,
     fixed_size: bool,
     fixed: (u32, u32),
@@ -547,12 +662,25 @@ fn buffer_size(
     match (lock_size, fixed_size, frame) {
         (false, _, _) => window.inner_size(),
         (true, true, _) => PhysicalSize::new(fixed.0, fixed.1),
-        (true, false, Some(f)) => PhysicalSize::new(f.width, f.height),
+        (true, false, Some((w, h))) => PhysicalSize::new(w, h),
         (true, false, None) => window.inner_size(),
     }
 }
 
-fn receive_frame(_: &(), frame: WlxFrame) -> Option<OwnedFrame> {
+fn receive_frame(_: &(), frame: WlxFrame) -> Option<Captured> {
+    if let WlxFrame::Dmabuf(frame) = &frame {
+        return match OwnedDmabuf::from_frame(frame) {
+            Ok(f) => Some(Captured::Dmabuf(f)),
+            Err(err) => {
+                log::warn!("dropping DMA-BUF frame: {err:#}");
+                None
+            }
+        };
+    }
+    receive_cpu_frame(frame).map(Captured::Cpu)
+}
+
+fn receive_cpu_frame(frame: WlxFrame) -> Option<OwnedFrame> {
     match frame {
         WlxFrame::MemFd(frame) => {
             let bytes = unsafe { copy_fd_bytes(frame.plane, frame.format.height).ok()? };
@@ -572,12 +700,7 @@ fn receive_frame(_: &(), frame: WlxFrame) -> Option<OwnedFrame> {
                 bytes,
             )
         }
-        WlxFrame::Dmabuf(_) => {
-            log::warn!(
-                "received DMA-BUF frame; CPU mirror path currently expects MemFd/MemPtr frames"
-            );
-            None
-        }
+        WlxFrame::Dmabuf(_) => None, // handled in receive_frame
     }
 }
 

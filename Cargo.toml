@@ -12,4 +12,7 @@ libc = "0.2"
 log = "0.4"
 softbuffer = "0.4.8"
 winit = "0.30.13"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
 wlx-capture = { git = "https://github.com/galister/wlx-capture.git", default-features = true }
