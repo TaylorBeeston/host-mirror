@@ -44,8 +44,15 @@ struct OwnedFrame {
     pixels: Vec<u32>,
 }
 
+impl Drop for HostInput {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
 struct HostInput {
     keyboard: UInputHandle<File>,
+    held_keys: std::cell::RefCell<std::collections::BTreeSet<u16>>,
     mouse: UInputHandle<File>,
     origin: (f32, f32),
     extent: (f32, f32),
@@ -142,6 +149,7 @@ impl HostInput {
 
         Ok(Self {
             keyboard,
+            held_keys: Default::default(),
             mouse,
             origin: (origin.0 as f32, origin.1 as f32),
             extent: (extent.0.max(1) as f32, extent.1.max(1) as f32),
@@ -202,6 +210,10 @@ impl HostInput {
     }
 
     fn key(&self, keycode: u16, pressed: bool) {
+        {
+            let mut held = self.held_keys.borrow_mut();
+            if pressed { held.insert(keycode); } else { held.remove(&keycode); }
+        }
         let time = get_time();
         let events = [
             new_event(time, EV_KEY, keycode, i32::from(pressed)),
@@ -209,6 +221,20 @@ impl HostInput {
         ];
         if let Err(err) = self.keyboard.write(&events) {
             log::warn!("keyboard write failed: {err}");
+        }
+    }
+
+    /// Release every key we pressed (focus loss / close / drop) so the host
+    /// never sees a modifier stuck down when the key-up went elsewhere.
+    fn release_all(&self) {
+        let held: Vec<u16> = std::mem::take(&mut *self.held_keys.borrow_mut()).into_iter().collect();
+        if held.is_empty() { return; }
+        log::info!("releasing {} held key(s): {:?}", held.len(), held);
+        let time = get_time();
+        let mut events: Vec<_> = held.iter().map(|&k| new_event(time, EV_KEY, k, 0)).collect();
+        events.push(new_event(time, EV_SYN, 0, 0));
+        if let Err(err) = self.keyboard.write(&events) {
+            log::warn!("keyboard release_all failed: {err}");
         }
     }
 
@@ -547,6 +573,9 @@ fn main() -> Result<()> {
             }
             Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => {
+                    if let Some(host_input) = &host_input {
+                        host_input.release_all();
+                    }
                     // Stardust panel close buttons/derez can fire by accident (e.g. black-hole
                     // collapses panels onto the hand). Mirrors ignore close unless opted in.
                     if std::env::var("HOST_MIRROR_CLOSE_EXITS").is_ok_and(|v| v == "1") {
@@ -604,6 +633,11 @@ fn main() -> Result<()> {
                                 host_input.scroll(pos.x as f32 / 16.0, pos.y as f32 / 16.0)
                             }
                         }
+                    }
+                }
+                WindowEvent::Focused(false) => {
+                    if let Some(host_input) = &host_input {
+                        host_input.release_all();
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
