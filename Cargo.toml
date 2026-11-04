@@ -1,0 +1,15 @@
+[package]
+name = "host-mirror"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-std = "1.13"
+env_logger = "0.11"
+input-linux = "0.7"
+libc = "0.2"
+log = "0.4"
+softbuffer = "0.4.8"
+winit = "0.30.13"
+wlx-capture = { git = "https://github.com/galister/wlx-capture.git", default-features = true }
