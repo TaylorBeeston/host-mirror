@@ -1,4 +1,5 @@
 mod dmabuf;
+mod stardust_keys;
 
 use anyhow::{anyhow, Context, Result};
 use dmabuf::{DmabufPresenter, OwnedDmabuf};
@@ -57,6 +58,8 @@ struct HostInput {
     /// is force-released (Stardust can drop key-ups, e.g. Super).
     last_key: std::cell::Cell<std::time::Instant>,
     key_hold_max: std::time::Duration,
+    /// Stardust has sent a nonzero modifier mask at least once (masks are trustworthy).
+    mask_seen: std::cell::Cell<bool>,
     mouse: UInputHandle<File>,
     origin: (f32, f32),
     extent: (f32, f32),
@@ -155,6 +158,7 @@ impl HostInput {
             keyboard,
             held_keys: Default::default(),
             last_key: std::cell::Cell::new(std::time::Instant::now()),
+            mask_seen: std::cell::Cell::new(false),
             key_hold_max: std::time::Duration::from_millis(
                 std::env::var("HOST_MIRROR_KEY_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500),
             ),
@@ -256,6 +260,26 @@ impl HostInput {
         if self.last_key.get().elapsed() >= self.key_hold_max {
             log::warn!("no key-up within {:?}; watchdog releasing", self.key_hold_max);
             self.release_all();
+        }
+    }
+
+    /// A key from the Stardust key sink: inject it, then drop any held modifier that
+    /// Stardust's own xkb mask says is up (only once masks have proven populated).
+    fn stardust_key(&self, k: stardust_keys::StardustKey) {
+        if stardust_keys::modifier_bit(k.keycode).is_some() {
+            log::info!("[stardust] modifier {} {} mask={:#x}", k.keycode, if k.pressed { "down" } else { "up" }, k.depressed);
+        }
+        self.key(k.keycode, k.pressed);
+        if k.depressed != 0 {
+            self.mask_seen.set(true);
+        }
+        if !self.mask_seen.get() {
+            return;
+        }
+        let stale = stardust_keys::stale_modifiers(self.held_keys.borrow().iter().copied(), k.depressed, k.keycode);
+        for m in stale {
+            log::warn!("[stardust] mask {:#x} says modifier {m} is up; releasing", k.depressed);
+            self.key(m, false);
         }
     }
 
@@ -418,6 +442,11 @@ fn main() -> Result<()> {
         None => "host-mirror".to_string(),
     };
     log::info!("window {title:?} app_id={app_id:?} size={win_w}x{win_h}");
+    // Option 2 keyboard: keys come from Stardust (Flatland KeyboardHandler) via a datagram
+    // sink; winit KeyboardInput is fallback-only until the first Stardust key arrives.
+    let stardust_keys = host_input.as_ref().and_then(|_| stardust_keys::StardustKeys::bind(&app_id));
+    let mut stardust_key_seen = false;
+    let mut winit_key_ignored_logged = false;
     let event_loop = EventLoop::new().context("create event loop")?;
     let window = Rc::new(
         event_loop
@@ -507,6 +536,15 @@ fn main() -> Result<()> {
         ));
         match event {
             Event::AboutToWait => {
+                if let (Some(host_input), Some(sk)) = (&host_input, &stardust_keys) {
+                    for k in sk.drain() {
+                        if !stardust_key_seen {
+                            log::info!("keyboard via Stardust key sink (winit keys now ignored)");
+                            stardust_key_seen = true;
+                        }
+                        host_input.stardust_key(k);
+                    }
+                }
                 if let Some(host_input) = &host_input {
                     host_input.release_stale();
                 }
@@ -681,7 +719,12 @@ fn main() -> Result<()> {
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
-                    if let Some(host_input) = &host_input {
+                    if stardust_key_seen {
+                        if !winit_key_ignored_logged {
+                            log::info!("ignoring winit KeyboardInput (Stardust key sink active)");
+                            winit_key_ignored_logged = true;
+                        }
+                    } else if let Some(host_input) = &host_input {
                         host_input.keyboard_input(
                             &event.physical_key,
                             event.state == ElementState::Pressed,
