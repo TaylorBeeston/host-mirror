@@ -359,7 +359,22 @@ fn main() -> Result<()> {
     let node_id = stream.node_id;
 
     let host_input = match (!opts.no_input)
-        .then(|| HostInput::new(desktop_origin, desktop_size))
+        .then(|| {
+            // The uinput mouse is absolute and unmapped, so mutter scales 0..1 over the WHOLE
+            // desktop (all monitors), not this stream's monitor. Normalise against the full
+            // layout box or every mirror but a lone monitor sends the cursor to the wrong screen.
+            // HOST_MIRROR_DESKTOP="x,y,w,h" (set by stardust-dual-mirror-flat from Mutter).
+            let layout = std::env::var("HOST_MIRROR_DESKTOP").ok().and_then(|v| {
+                let n: Vec<i32> = v.split(',').map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
+                (n.len() == 4 && n[2] > 0 && n[3] > 0).then(|| ((n[0], n[1]), (n[2], n[3])))
+            });
+            let (o, e) = layout.unwrap_or_else(|| {
+                log::warn!("HOST_MIRROR_DESKTOP unset: mouse maps to this monitor only (wrong on multi-monitor)");
+                (desktop_origin, desktop_size)
+            });
+            log::info!("pointer layout origin={o:?} extent={e:?}");
+            HostInput::new(o, e)
+        })
         .transpose()
     {
         Ok(host_input) => host_input,
